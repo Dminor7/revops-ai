@@ -3,51 +3,82 @@
 An extensible SDK for building **auditable, write-safe RevOps AI agents** — built for GTM
 AI Engineers who need agent decisions they can defend in front of a VP, not just demo.
 
-> Status: **alpha (M0)**. Core engine, typed tasks/reports, agent extension contract, and
-> freshness policies are functional. Connectors, the audit ledger, write-intents, and the
-> serving layer land in M1–M3 — see [PLAN.md](PLAN.md).
+> Status: **alpha**. Core engine, trust layer (audit ledger, write intents, replay),
+> connectors (HubSpot, Stripe, SQL warehouse), serving layer, and two shipped agents are
+> functional and fully tested. See [PLAN.md](PLAN.md) for the architecture and roadmap.
 
 ## Design principles
 
 - **Inversion of control.** You inject connectors (with your credentials), an LLM
   configuration, and policies into a `RevOpsEngine`. The SDK ships the orchestration;
   your environment owns the secrets and the data layer.
-- **Typed everything.** Tasks in, reports out — all pydantic models. Natural language is
-  a router on top of the typed API, never a parallel path.
-- **Evidence, not verdicts.** Findings structurally require evidence, and every report
+- **Typed everything.** Tasks in, reports out — all pydantic models. Natural language
+  (`engine.run_analysis("...")`) is a router that parses text into a registered task,
+  never a parallel code path.
+- **Evidence, not verdicts.** Findings structurally require evidence; every report
   carries the vintage of the data it was computed from.
+- **Agents propose, policies dispose.** No agent can call a write API. Writes are
+  `WriteIntent`s flowing through field allowlists, blast-radius limits, a dry-run
+  default, approval queues, and idempotency keys.
+- **Every run is reconstructable.** The ledger records the task, every tool call, every
+  intent transition; `engine.replay(run_id)` re-executes a run from recorded tool
+  outputs without touching live systems.
 - **Fail at assembly, not mid-run.** Missing connectors, capabilities, or model config
-  raise when you register an agent — not on a Monday morning.
-- **Rent the plumbing.** The LLM loop is [pydantic-ai](https://ai.pydantic.dev) (isolated
-  in one module); validation is pydantic; serving will be FastAPI. The SDK's own code is
+  raise when you register an agent.
+- **Rent the plumbing.** The LLM loop is [pydantic-ai](https://ai.pydantic.dev);
+  validation is pydantic; SQL is SQLAlchemy; serving is FastAPI. The SDK's own code is
   the GTM domain layer: guardrails, audit, freshness, evidence.
 
-## Quick start
+## Install
+
+```bash
+pip install revops-ai                       # core
+pip install 'revops-ai[warehouse,server]'   # extras: hubspot, salesforce, stripe,
+                                            # warehouse, server, openai, anthropic
+```
+
+## Quick start: shipped agents
 
 ```python
-from revops_ai import (
-    BaseAgent, Capability, LLMConfig, Report, RevOpsEngine, RunContext, Task, Tool,
+from revops_ai import RevOpsEngine, LLMConfig, FreshnessPolicy, WritePolicy
+from revops_ai.agents import PipelineVelocityAgent, ChurnPredictorAgent, PipelineEvaluationTask
+from revops_ai.connectors.hubspot import HubSpotConnector   # reads HUBSPOT_ACCESS_TOKEN
+from revops_ai.connectors.stripe import StripeConnector     # reads STRIPE_API_KEY
+from revops_ai.connectors.warehouse import WarehouseConnector
+
+engine = RevOpsEngine(
+    llm=LLMConfig(model="openai:gpt-4o", fallback="anthropic:claude-sonnet-4-6"),
 )
+engine.register_connector("crm", HubSpotConnector())
+engine.register_connector("billing", StripeConnector())
+engine.register_connector("warehouse", WarehouseConnector("postgresql+asyncpg://..."))
 
-# 1. Define (or import) a connector — anything satisfying the Connector protocol.
-class WarehouseConnector:
-    capabilities = frozenset({Capability.READ})
-    def sync_metadata(self): ...
-    async def health_check(self): ...
+engine.register_agent(PipelineVelocityAgent())
+engine.register_agent(ChurnPredictorAgent(sensitivity="high"))
 
-# 2. Declare a typed task and report.
+report = await engine.run(PipelineEvaluationTask(stage="Commit", quarter="2026-Q3"))
+print(report.to_markdown())        # evidence-backed findings + data vintage
+print(report.run_id)               # fully reconstructable from the ledger
+
+# Or route natural language onto the same typed, audited path:
+report = await engine.run_analysis("Evaluate all open deals in the Commit stage for Q3.")
+```
+
+## Custom agents
+
+Tools are *declared*, not constructed — the engine binds them to your connectors at
+registration, so one agent class serves many environments (multi-tenant safe):
+
+```python
+from revops_ai import BaseAgent, Report, RunContext, Task
+from revops_ai.tools import SQLQueryTool
+
 class CommissionTask(Task):
     deal_id: str
 
 class CommissionReport(Report):
     deal_id: str
-    status: str
     payout_tier: str
-
-# 3. Write your agent. Tools are *declared*, not constructed — the engine
-#    binds them to your connectors at registration (multi-tenant safe).
-class SQLQueryTool(Tool):
-    async def query_one(self, sql: str, **params): ...
 
 class CommissionAgent(BaseAgent[CommissionTask, CommissionReport]):
     name = "commission_calculator"
@@ -61,45 +92,87 @@ class CommissionAgent(BaseAgent[CommissionTask, CommissionReport]):
             "SELECT margin FROM deals WHERE id = :deal_id", deal_id=task.deal_id
         )
         tier = "Alpha - 15%" if float(row["margin"]) > 40 else "Standard - 8%"
-        return CommissionReport(deal_id=task.deal_id, status="approved", payout_tier=tier)
-
-# 4. Assemble the engine in *your* environment and run.
-engine = RevOpsEngine(llm=LLMConfig(model="openai:gpt-4o"))
-engine.register_connector("warehouse", WarehouseConnector())
-engine.register_agent(CommissionAgent())
-
-report = await engine.run(CommissionTask(deal_id="D-1"))
-print(report.payout_tier, report.data_vintage)
+        return CommissionReport(deal_id=task.deal_id, payout_tier=tier)
 ```
 
-LLM-backed agents subclass `LLMAgent` instead and get a typed pydantic-ai loop with the
-engine's configured model (with fallback support); deterministic agents need no model at
-all.
+LLM-backed agents subclass `LLMAgent` and get a typed pydantic-ai loop with the engine's
+configured model; deterministic agents need no model at all.
+
+## Write-back safety
+
+```python
+from revops_ai import EntityRef, FieldChange, WriteIntent, WritePolicy
+
+engine = RevOpsEngine(
+    write_policy=WritePolicy(
+        field_allowlists={"crm": {"next_step", "risk_note"}},  # nothing else, ever
+        max_writes_per_run=25,                                  # blast-radius breaker
+    ),
+    write_mode="apply",  # default is "dry_run": intents are produced, nothing written
+)
+
+# Inside an agent: propose, never write.
+ctx.propose_write(WriteIntent(
+    connector_role="crm", operation="update",
+    target=EntityRef(source_system="hubspot", entity_type="deal", entity_id="123"),
+    changes={"next_step": FieldChange(new="Schedule exec sync")},
+    justification=[...],   # Evidence required by schema
+))
+
+# Outside: human-in-the-loop.
+engine.pending_intents()
+await engine.approve_intent(intent_id)   # applied with idempotency
+engine.reject_intent(intent_id, "wrong deal")
+```
+
+## Audit and replay
+
+```python
+record = engine.ledger.get_run(report.run_id)     # task, agent, status, report
+events = engine.ledger.get_events(report.run_id)  # every tool call, inputs and outputs
+
+replayed = await engine.replay(report.run_id)     # recorded data, no live access,
+                                                  # writes never applied
+```
+
+## Serve it
+
+```python
+from revops_ai.server import WebhookListener, create_api
+
+listener = WebhookListener(engine, secrets={"hubspot": "...", "stripe": "..."})
+listener.bind("hubspot", "deal.propertyChange",
+              lambda event: CommissionTask(deal_id=event.object_id))
+
+app = create_api(engine, webhooks=listener)
+# uvicorn main:app — typed task endpoints, run ledger, approval queue,
+# replay, health, and signature-verified webhooks (unsigned => 401).
+```
 
 ## Freshness policies
 
 ```python
 from datetime import timedelta
-from revops_ai import FreshnessPolicy
-
-engine = RevOpsEngine(
-    freshness=FreshnessPolicy(max_staleness=timedelta(hours=6), on_violation="fail"),
-)
+engine = RevOpsEngine(freshness=FreshnessPolicy(max_staleness=timedelta(hours=6),
+                                                on_violation="fail"))
 ```
 
-Every connector reports `sync_metadata()`; runs against stale data either warn or abort,
-and every report's `data_vintage` records exactly how fresh each source was.
+Every connector reports `sync_metadata()` (warehouse connectors accept a
+`sync_resolver` to surface your ELT tool's real sync time); runs against stale data warn
+or abort, and every report's `data_vintage` records how fresh each source was.
 
 ## Development
 
 ```bash
 uv venv && uv pip install -e . --group dev
-pytest
-ruff check src tests && mypy
+pytest                       # 58 tests, all offline (respx, SQLite, FunctionModel)
+ruff check src tests && mypy # mypy --strict
 ```
 
 ## Roadmap
 
-See [PLAN.md](PLAN.md) for the full architecture and the M0–M4 roadmap (connectors,
-audit ledger with replay, write-intent pipeline with approvals, FastAPI serving, webhook
-listeners).
+See [PLAN.md](PLAN.md). Done: M0 core, M1 data layer (HubSpot/Stripe/warehouse,
+retrieval adapter, NL router), M2 trust layer (ledger, intents, replay), M3 serving
+(API + verified webhooks), M4 shipped agents. Next: SQLAlchemy-backed ledger +
+Alembic, OTel/Langfuse exporter, pgvector/Qdrant adapters, Salesforce connector, CLI,
+Temporal runner, docs site, PyPI release.

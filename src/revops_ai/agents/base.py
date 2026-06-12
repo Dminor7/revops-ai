@@ -96,10 +96,14 @@ class LLMAgent(BaseAgent[TaskT, ReportT]):
             self._resolve_model(),
             deps_type=RunContext,
             output_type=cast("type[ReportT]", self.report_type),
-            instructions=self.instructions or self.description,
+            instructions=self.get_instructions(),
         )
         self.configure(agent)
         return agent
+
+    def get_instructions(self) -> str:
+        """Instructions for the model; override for instance-level config."""
+        return self.instructions or self.description
 
     def configure(self, agent: PydanticAIAgent[RunContext, ReportT]) -> None:
         """Hook for subclasses to register pydantic-ai tools on the agent."""

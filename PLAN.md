@@ -1,5 +1,12 @@
 # revops-ai SDK — Architecture & Implementation Plan
 
+> **Status (2026-06-12):** M0–M4 core scope is implemented and tested (58 offline
+> tests, mypy --strict). Shipped: engine + registries, trust layer (ledger, write
+> intents, recorded replay), HubSpot/Stripe/warehouse connectors, retrieval adapter
+> with in-memory store, NL router, FastAPI serving with verified webhooks, and the
+> PipelineVelocity/ChurnPredictor agents. Deviations from this plan and remaining
+> backlog are listed at the bottom (§9).
+
 Target user: GTM AI Engineers at a ~500-person SaaS company. The bar is not "works in a
 demo" — it's "survives a Monday morning incident review": every agent decision is
 auditable, every CRM write is gated, and stale data is surfaced, not silently consumed.
@@ -313,3 +320,26 @@ incident" runbook, PyPI release with trusted publishing + `pip-audit` in CI.
   agents; shipped agents are tested against ≥2 providers.
 - **Ledger PII**: redaction hooks are in the event-write path from M2 day one — retrofitting
   redaction into an audit log is how compliance reviews fail.
+
+---
+
+## 9. Implementation status and deviations
+
+Deliberate deviations from the plan above:
+
+- **Connectors are async httpx clients, not wrappers over official SDKs.** The official
+  HubSpot/Stripe Python SDKs are sync and would block the engine's event loop; the read
+  surface we need (deals, customers, subscriptions, pagination, auth) is small, and
+  respx gives offline contract tests. Revisit if the surface grows.
+- **The ledger is a protocol with an in-memory default**; the SQLAlchemy/Alembic ledger
+  is backlog, not shipped. Same for the JSONL/Postgres sinks.
+- **Tool-call recording covers connector I/O; LLM request/response recording is not in
+  the ledger yet** — that lands with the OTel GenAI integration. Recorded replay is
+  exact for deterministic agents; LLM agents replay tool I/O with a live model.
+- **`pydantic-ai` isolation is per-module, not per-package**: agents/base.py, the
+  router, and the two shipped agents import it; the core engine/public API do not.
+
+Backlog (rough priority): SQLAlchemy ledger + redaction hooks, OTel spans + Langfuse
+exporter, pgvector/Qdrant adapters + embedder implementations, Salesforce connector,
+`revops-ai` CLI (runs show/replay), Temporal runner, Slack approval notifications,
+docs site, PyPI trusted publishing.
