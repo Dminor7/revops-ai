@@ -78,24 +78,14 @@ class LLMAgent(BaseAgent[TaskT, ReportT]):
         self._pai_agent = None
 
     def _resolve_model(self) -> Model | str:
-        from pydantic_ai.models import Model
+        from revops_ai._llm import resolve_model
 
         if self._llm is None:
             raise RuntimeError(
                 f"LLMAgent {self.name!r} has no model bound; register it with an "
                 "engine configured with an LLMConfig."
             )
-        if self._llm.fallback is not None and isinstance(self._llm.model, str):
-            from pydantic_ai.models.fallback import FallbackModel
-
-            return FallbackModel(self._llm.model, self._llm.fallback)
-        model = self._llm.model
-        if not isinstance(model, str | Model):
-            raise TypeError(
-                f"LLMConfig.model must be a model id string or a pydantic-ai Model, "
-                f"got {type(model).__name__}."
-            )
-        return model
+        return resolve_model(self._llm)
 
     def _build(self) -> PydanticAIAgent[RunContext, ReportT]:
         from pydantic_ai import Agent as PydanticAIAgent

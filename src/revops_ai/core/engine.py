@@ -15,7 +15,10 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from revops_ai.core.router import TaskRouter
 
 from revops_ai.agents.base import BaseAgent, LLMAgent
 from revops_ai.audit.ledger import AuditLedger, InMemoryAuditLedger, RunRecord, RunStatus
@@ -77,6 +80,7 @@ class RevOpsEngine:
         self.connectors = ConnectorRegistry()
         self._agents_by_task: dict[type[Task], _RegisteredAgent] = {}
         self._agents_by_name: dict[str, _RegisteredAgent] = {}
+        self._router: TaskRouter | None = None
 
     # -- assembly -----------------------------------------------------------
 
@@ -123,6 +127,7 @@ class RevOpsEngine:
         registered = _RegisteredAgent(agent, tools)
         self._agents_by_name[agent.name] = registered
         self._agents_by_task[agent.task_type] = registered
+        self._router = None  # task set changed; rebuild the NL router lazily
 
     @property
     def agent_names(self) -> list[str]:
@@ -177,6 +182,27 @@ class RevOpsEngine:
             run_id, RunStatus.SUCCEEDED, report_json=report.model_dump_json()
         )
         return report
+
+    async def run_analysis(self, text: str) -> Report:
+        """Route a natural-language request to a typed task and run it.
+
+        This is a front-end over :meth:`run`: an LLM parses the text into one
+        of the registered task types, then execution follows the identical
+        typed, ledgered path.
+        """
+        from revops_ai.core.router import TaskRouter
+        from revops_ai.exceptions import RevOpsError
+
+        if self.llm is None:
+            raise RevOpsError(
+                "run_analysis requires an LLMConfig: pass RevOpsEngine(llm=LLMConfig(...))."
+            )
+        if not self._agents_by_task:
+            raise RevOpsError("run_analysis requires at least one registered agent.")
+        if self._router is None:
+            self._router = TaskRouter(self.llm, list(self._agents_by_task))
+        task = await self._router.route(text)
+        return await self.run(task)
 
     async def replay(self, run_id: str) -> Report:
         """Re-execute a recorded run from its ledgered tool outputs.
