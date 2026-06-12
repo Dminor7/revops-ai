@@ -30,3 +30,6 @@ class Tool:
     def __init__(self, connector: Connector, role: str) -> None:
         self.connector = connector
         self.role = role
+        #: Effective capabilities granted at registration; the registry may
+        #: widen this beyond required_capabilities up to the connector's grant.
+        self.granted_capabilities: frozenset[Capability] = self.required_capabilities

@@ -50,3 +50,11 @@ class NoAgentForTaskError(RevOpsError):
 
 class StaleDataError(RevOpsError):
     """A freshness policy with on_violation='fail' was violated."""
+
+
+class ReplayError(RevOpsError):
+    """A run could not be replayed from its recorded events."""
+
+
+class WriteError(RevOpsError):
+    """A write intent could not be processed (approval, application, lookup)."""

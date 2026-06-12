@@ -7,15 +7,26 @@ text *into* a Task — never a parallel code path.
 
 Reports are never bare verdicts: findings carry :class:`Evidence` so a GTM
 engineer can show a VP *why*, and every report records the vintage of the data
-it was computed from.
+it was computed from plus any writes the agent proposed.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from revops_ai.audit.evidence import EntityRef, Evidence, Finding, SourceRef
+from revops_ai.safety.write_intent import WriteIntent
+
+__all__ = [
+    "EntityRef",
+    "Evidence",
+    "Finding",
+    "Report",
+    "SourceRef",
+    "Task",
+]
 
 
 class Task(BaseModel):
@@ -30,51 +41,16 @@ class Task(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
-class EntityRef(BaseModel):
-    """A pointer to a record in a source system (deal, account, contact...)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    source_system: str
-    entity_type: str
-    entity_id: str
-    url: str | None = None
-
-
-class SourceRef(BaseModel):
-    """Where a piece of evidence came from: a query, a record, a chunk."""
-
-    model_config = ConfigDict(frozen=True)
-
-    kind: Literal["query", "record", "chunk", "model"]
-    reference: str
-
-
-class Evidence(BaseModel):
-    """One load-bearing fact behind a finding."""
-
-    kind: Literal["metric", "record", "retrieval", "llm_judgment"]
-    summary: str
-    source: SourceRef
-
-
-class Finding(BaseModel):
-    """A verdict about one entity, with the evidence that supports it."""
-
-    subject: EntityRef
-    verdict: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    evidence: list[Evidence] = Field(min_length=1)
-
-
 class Report(BaseModel):
     """Base class for all agent outputs.
 
-    ``data_vintage`` is populated by the engine from connector sync metadata;
-    agents do not set it themselves.
+    ``run_id``, ``data_vintage``, and ``proposed_writes`` are stamped by the
+    engine; agents do not set them.
     """
 
+    run_id: str | None = None
     data_vintage: dict[str, datetime] = Field(default_factory=dict)
+    proposed_writes: list[WriteIntent] = Field(default_factory=list)
 
     def to_markdown(self) -> str:
         """Render an evidence-backed brief. Subclasses may override."""
@@ -84,7 +60,7 @@ class Report(BaseModel):
         if self.data_vintage:
             lines.append("")
         for name, value in self:
-            if name == "data_vintage":
+            if name in ("data_vintage", "run_id", "proposed_writes"):
                 continue
             if isinstance(value, list) and value and isinstance(value[0], Finding):
                 for finding in value:
@@ -96,4 +72,13 @@ class Report(BaseModel):
                     lines.append("")
             else:
                 lines.append(f"- **{name}**: {value}")
+        if self.proposed_writes:
+            lines.append("")
+            lines.append("## Proposed writes")
+            for intent in self.proposed_writes:
+                fields = ", ".join(sorted(intent.changes))
+                lines.append(
+                    f"- [{intent.status.value}] {intent.operation} "
+                    f"{intent.target.entity_type} {intent.target.entity_id} ({fields})"
+                )
         return "\n".join(lines).rstrip() + "\n"

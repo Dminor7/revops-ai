@@ -71,4 +71,8 @@ class ConnectorRegistry:
                 f"{role!r}, but the connector is registered with "
                 f"{sorted(c.value for c in entry.capabilities)}."
             )
-        return tool_cls(connector=entry.connector, role=role)
+        tool = tool_cls(connector=entry.connector, role=role)
+        # Least privilege: the tool gets what it declared, never the
+        # connector's full grant.
+        tool.granted_capabilities = tool_cls.required_capabilities & entry.capabilities
+        return tool
